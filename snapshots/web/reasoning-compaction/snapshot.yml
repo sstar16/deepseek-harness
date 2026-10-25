@@ -1,0 +1,9 @@
+version: 1
+scenario: reasoning-compaction
+profile: web
+composition: web-reasoning-compaction
+recording: authored
+header:
+  class: web-reasoning-compaction
+  pin: true
+  changes: 1

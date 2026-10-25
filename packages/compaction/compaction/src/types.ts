@@ -7,7 +7,7 @@
  * @module @deepseek-ai/dsh-compaction/types
  */
 
-import type { ContentBlock, TokenUsage } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, ReasoningEffortId, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
 import type { SessionSeq } from '@deepseek-ai/dsh-session/types'
 import type { CompactionId } from './brand.ts'
@@ -47,6 +47,8 @@ declare module '@deepseek-ai/dsh-session/types' {
        * this summary" has a durable answer (the reconstructability Agent Note).
        */
       model: string
+      /** Reasoning effort explicitly supplied in the summarize call's envelope, when present. */
+      reasoningEffort?: ReasoningEffortId
       /** The generation cap the summarize call sent, when one applied. */
       maxTokens?: number
       /** Provider-reported token usage for the summarization request, when emitted. */
