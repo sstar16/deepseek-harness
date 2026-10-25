@@ -8,6 +8,7 @@ import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
 import type { AgentHandle } from '@deepseek-ai/dsh-agent'
 import { ToolCallId, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
+import type { BasicCompactionEngine } from '@deepseek-ai/dsh-compaction-basic'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-agent-preset-registry'
@@ -204,27 +205,47 @@ describe('minimal manual compaction', () => {
   let handle: AgentHandle
   let browser: Browser | undefined
   let page: Page | undefined
+  let recentPrompt = ''
+  let mountedCompaction: BasicCompactionEngine | undefined
   const requests: GenerateOptions[] = []
 
   beforeAll(async () => {
     const fixture = join(snapshotDir, 'session.v4.jsonl')
     const prompts = fixtureUserPrompts(await readFile(fixture, 'utf8'))
-    expect(prompts).toHaveLength(2)
-    const [initial, continuation] = prompts
-    if (initial === undefined || continuation === undefined) throw new Error('minimal compaction fixture requires two user prompts')
-    scaffold = await launchWebScaffold({ replayFixture: fixture, compareReplaySession: true, workspacePathLength: 192 })
+    expect(prompts).toHaveLength(3)
+    const [initial, recent, continuation] = prompts
+    if (initial === undefined || recent === undefined || continuation === undefined) {
+      throw new Error('minimal compaction fixture requires two history prompts and one continuation')
+    }
+    recentPrompt = recent
+    scaffold = await launchWebScaffold({
+      replayFixture: fixture,
+      compareReplaySession: true,
+      workspacePathLength: 192,
+      extraOverlayPath: join(snapshotDir, 'cordis.snapshot.yml'),
+    })
     scaffold.ctx.on('llm/stream', async function* (options, next) {
       requests.push(options)
       yield* next()
     })
     handle = await scaffold.ctx.agents.create({
       sessionId: SessionId('minimal-compact-smoke'),
-      meta: { cwd: scaffold.workspaceCwd, agentPreset: 'minimal' },
+      meta: { cwd: scaffold.workspaceCwd, agentPreset: 'minimal-pressure' },
       agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
-      setup: agentCtx => scaffold.ctx.agentPresets.mount(agentCtx, 'minimal').then(() => undefined),
+      setup: async (agentCtx) => {
+        await scaffold.ctx.agentPresets.mount(agentCtx, 'minimal-pressure')
+        mountedCompaction = scaffold.ctx.agentPresets.serviceFor({ ctx: agentCtx }, 'compaction') as BasicCompactionEngine | undefined
+      },
+    })
+    expect(mountedCompaction?.config).toMatchObject({
+      auto: false, thresholdRatio: 0.001, headroomTokens: 0, maxTokens: 32, retainTokens: 100,
     })
     handle.agent.followup(createUserMessage({
       content: [{ type: 'text', text: initial }], source: { kind: 'user' },
+    }))
+    await handle.agent.whenIdle()
+    handle.agent.followup(createUserMessage({
+      content: [{ type: 'text', text: recent }], source: { kind: 'user' },
     }))
     await handle.agent.whenIdle()
     const session = handle.agent.session
@@ -273,11 +294,21 @@ describe('minimal manual compaction', () => {
     expect(session.deriveMessages().some(message => message.id === original.data.id)).toBe(false)
   })
 
+  it('keeps the recent turn out of the pressured summary request', () => {
+    const summaryRequest = requests.find(request => request.purpose === 'compaction')
+    expect(summaryRequest).toBeDefined()
+    expect(summaryRequest?.messages.some(message => (
+      message.content.some(block => block.type === 'text' && block.text === recentPrompt)
+    ))).toBe(false)
+    const summary = handle.agent.session.snapshotEvents().find(event => event.type === 'compaction/summary')
+    expect(summary?.data.shadowedSeqs).toHaveLength(2)
+  })
+
   it('continues with the summary and the same minimal prompt and tools', () => {
-    expect(requests.map(request => request.purpose)).toEqual([undefined, 'compaction', undefined])
+    expect(requests.map(request => request.purpose)).toEqual([undefined, undefined, 'compaction', undefined])
     const summary = handle.agent.session.snapshotEvents().find(event => event.type === 'compaction/summary')
     if (summary === undefined) throw new Error('minimal compaction produced no summary')
-    const [initial, , continuation] = requests
+    const [initial, , , continuation] = requests
     if (initial === undefined || continuation === undefined) throw new Error('minimal compaction did not continue')
     expect(continuation.messages.flatMap(message => message.content)).toEqual(expect.arrayContaining(summary.data.summary))
     expect(continuation.messages[0]).toEqual(initial.messages[0])
@@ -309,7 +340,7 @@ describe('minimal manual compaction', () => {
 
   it('keeps its snapshot inventory closed', async () => {
     await assertFixtureInventory(snapshotDir, [
-      'session.v4.jsonl', 'system-prompt.expected.md', 'tool-schemas.expected.json', 'ui.expected.md',
+      'session.v4.jsonl', 'cordis.snapshot.yml', 'system-prompt.expected.md', 'tool-schemas.expected.json', 'ui.expected.md',
     ])
   })
 })

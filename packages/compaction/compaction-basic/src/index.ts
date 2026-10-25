@@ -399,6 +399,10 @@ export class BasicCompactionEngine extends CompactionEngine {
   /**
    * Force one useful idle-session compaction below the pressure threshold, and
    * resolve only after its standalone marker pair is durably checkpointed.
+   * Below the threshold, selection stays maximal; at or above it, the logged
+   * route's resolved retention bounds the replayed history. Missing capacity,
+   * an unresolvable pressure policy, or no range under that retention restores
+   * the maximal manual fallback.
    * @param agent - idle agent whose next-turn admission this call reserves.
    * @param signal - cancellation scoped to this compaction request.
    * @param sourceCommandId - initiating command identity for presentation correlation.
@@ -415,11 +419,30 @@ export class BasicCompactionEngine extends CompactionEngine {
         const operationSignal = AbortSignal.any([agentSignal, signal])
         try {
           operationSignal.throwIfAborted()
+          const measurement = this.ctx.tokenMeter.measure(agent.session)
+          const header = agent.session.requestHeader()
+          const contextWindow = agent.session.requestContext()?.contextWindow
+          let retainTokens = 0
+          if (header !== undefined && contextWindow !== undefined && routedTarget(agent.session) !== undefined) {
+            const target = header.config
+            try {
+              const spec = resolveCompactSpec(
+                resolveTargetPolicy(this.config, target),
+                contextWindow,
+                reservedCompletionTokens(header, undefined),
+              )
+              if (measurement.totalTokens >= spec.thresholdTokens) retainTokens = spec.retainTokens
+            } catch (error) {
+              // A pressure policy that cannot resolve does not invalidate the
+              // long-standing maximal manual reduction.
+              if (!(error instanceof TargetPressureConfigError)) throw error
+            }
+          }
           const range = selectCompactableRange(
             agent.session,
-            this.ctx.tokenMeter.measure(agent.session),
-            0,
-          )
+            measurement,
+            retainTokens,
+          ) ?? (retainTokens === 0 ? null : selectCompactableRange(agent.session, measurement, 0))
           if (range === null) return null
           return await compactSurfaceRegion(
             this.regionDependencies(),

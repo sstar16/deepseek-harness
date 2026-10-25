@@ -4,7 +4,7 @@ import { Context } from '@deepseek-ai/cordis'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
 import { CommandId } from '@deepseek-ai/dsh-commands/brand'
-import { BasicCompactionEngine } from '@deepseek-ai/dsh-compaction-basic'
+import { BasicCompactionEngine, type BasicCompactionConfig } from '@deepseek-ai/dsh-compaction-basic'
 import { CompactionId, isCompactCheckpointSource, ManualCompactionError } from '@deepseek-ai/dsh-compaction'
 import type { CompactionResult } from '@deepseek-ai/dsh-compaction'
 import {
@@ -14,6 +14,7 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import type {
   ContentBlock,
+  GenerateOptions,
   LlmResolvedModelInfo,
   Message,
   RequestMessage,
@@ -25,6 +26,7 @@ import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import LlmRuntime from '@deepseek-ai/dsh-llm'
 import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
+import { estimateContent, ROLE_OVERHEAD } from '@deepseek-ai/dsh-token-meter/estimate'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {
   SummarizationInput,
@@ -49,16 +51,18 @@ class GatedCompactionEngine extends BasicCompactionEngine {
   rawOutput: ContentBlock[] | undefined
   usage: TokenUsage | undefined
   error: unknown
+  useDefaultSummarizer = false
   gate: Promise<undefined> | undefined
   duringSummary: (() => void) | undefined
   calls: SummarizationInput[] = []
 
   override async summarize(
     input: SummarizationInput,
-    _agent: Agent,
-    _signal?: AbortSignal,
+    agent: Agent,
+    signal?: AbortSignal,
   ): Promise<SummaryResult> {
     this.calls.push(input)
+    if (this.useDefaultSummarizer) return super.summarize(input, agent, signal)
     this.duringSummary?.()
     if (this.gate !== undefined) await this.gate
     if (this.error !== undefined) throw this.error
@@ -72,21 +76,38 @@ class GatedCompactionEngine extends BasicCompactionEngine {
   }
 }
 
-/** One text answer per request, with a context window large enough to avoid pressure. */
+/** One text answer per request, with a context window large enough to avoid pressure by default. */
 class TextAdapter extends LlmAdapter {
   readonly requests: RequestMessage[][] = []
+  requestTokenLimit: number | undefined
+  lastRequestTokens: number | undefined
+
+  constructor(
+    private readonly contextWindow = 100_000,
+    private readonly estimateMessage?: (message: RequestMessage) => number,
+  ) {
+    super()
+  }
 
   override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
     return Promise.resolve({
       provider,
       id: model,
       name: model,
-      context: { contextWindow: 100_000 },
+      context: { contextWindow: this.contextWindow },
     })
   }
 
-  override async * stream(options: { messages: readonly RequestMessage[] }): AsyncIterable<StreamChunk> {
+  override async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     this.requests.push([...options.messages])
+    if (this.requestTokenLimit !== undefined) {
+      if (this.estimateMessage === undefined) throw new Error('token-limited adapter requires a message estimator')
+      const inputTokens = options.messages.reduce((total, message) => total + this.estimateMessage!(message), 0)
+      this.lastRequestTokens = inputTokens + (options.maxTokens ?? 0)
+      if (this.lastRequestTokens > this.requestTokenLimit) {
+        throw new Error(`summary request tokens ${this.lastRequestTokens} exceed the model context window ${this.requestTokenLimit}`)
+      }
+    }
     yield { type: 'block-start', index: 0, blockType: 'text' }
     yield { type: 'block-end', index: 0, block: { type: 'text', text: 'answer' } }
     yield { type: 'finish', reason: { kind: 'stop' } }
@@ -219,19 +240,23 @@ function fakeAgent(
 }
 
 /** Service over a store-detached session for failure classification. */
-function detachedService(): { ctx: Context; compact: GatedCompactionEngine; flushes: () => number } {
+function detachedService(
+  config: BasicCompactionConfig = { auto: false },
+  contextWindow = 100_000,
+): { ctx: Context; compact: GatedCompactionEngine; adapter: TextAdapter; flushes: () => number } {
   const ctx = new Context()
   void new LlmRuntime(ctx)
   void new SessionStore(ctx)
   new SessionProjectionRegistry(ctx)
   void new TokenMeter(ctx)
-  ctx.llm.registerAdapter([MODEL], new TextAdapter())
+  const adapter = new TextAdapter(contextWindow, message => estimateContent(message.content) + ROLE_OVERHEAD)
+  ctx.llm.registerAdapter([MODEL], adapter)
   let flushes = 0
   vi.spyOn(ctx.sessions, 'flush').mockImplementation(() => {
     flushes += 1
     return Promise.resolve(false)
   })
-  return { ctx, compact: new GatedCompactionEngine(ctx, { auto: false }), flushes: () => flushes }
+  return { ctx, compact: new GatedCompactionEngine(ctx, config), adapter, flushes: () => flushes }
 }
 
 function compactEvents(session: Session): SessionEvent[] {
@@ -443,6 +468,71 @@ describe('compactNow transaction and failure classification', () => {
     expect(summaryEvent?.data.sourceCommandId).toBe(commandId)
     expect(checkpoint?.data.source).toMatchObject(correlated)
     expect(end?.data).toEqual({ ...correlated, turn: null })
+  })
+
+  it('keeps a pressured manual summary request within the routed window', async () => {
+    const { ctx, compact, adapter } = detachedService({
+      auto: false,
+      headroomTokens: 0,
+      maxTokens: 32,
+      thresholdRatio: 1,
+      retainTokens: 50,
+    }, 1000)
+    compact.useDefaultSummarizer = true
+    adapter.requestTokenLimit = 1000
+    const session = closedConversation(2)
+    session.append('request/header', {
+      header: { config: { provider: MODEL, model: MODEL, maxTokens: 800 } },
+      reason: 'resume',
+    })
+    session.append('request/context', { provider: MODEL, model: MODEL, contextWindow: 1000 })
+    const nodes = [...session.surface.nodes]
+    expect(ctx.tokenMeter.measure(session).totalTokens).toBeGreaterThan(200)
+    const agent = fakeAgent(session, () => () => undefined)
+
+    const result = await compact.compactNow(agent, SIGNAL)
+
+    expect(result?.shadowedRange).toEqual({ start: nodes[0], end: nodes[1] })
+    expect(adapter.lastRequestTokens).toBeLessThanOrEqual(1000)
+    expect(adapter.requests[0]).toHaveLength(3)
+  })
+
+  it('falls back to a maximal manual range when retention leaves no compactable span', async () => {
+    const { ctx, compact } = detachedService({
+      auto: false,
+      headroomTokens: 0,
+      maxTokens: 32,
+      thresholdRatio: 0.5,
+      retainTokens: 450,
+    }, 1000)
+    const session = closedConversation(1)
+    session.append('request/header', {
+      header: {
+        config: { provider: MODEL, model: MODEL },
+        tools: [{ name: 'large-schema', description: 'x'.repeat(1000), parameters: { type: 'object' } }],
+      },
+      reason: 'resume',
+    })
+    session.append('request/context', { provider: MODEL, model: MODEL, contextWindow: 1000 })
+    expect(ctx.tokenMeter.measure(session).totalTokens).toBeGreaterThan(500)
+    const agent = fakeAgent(session, () => () => undefined)
+
+    const result = await compact.compactNow(agent, SIGNAL)
+
+    expect(result).not.toBeNull()
+    expect(compact.calls[0]?.messages).toHaveLength(1)
+  })
+
+  it('preserves maximal manual selection when the pressure policy cannot resolve', async () => {
+    const { compact } = detachedService({ auto: false }, 1000)
+    const session = closedConversation(2)
+    session.append('request/context', { provider: MODEL, model: MODEL, contextWindow: 1000 })
+    const agent = fakeAgent(session, () => () => undefined)
+
+    const result = await compact.compactNow(agent, SIGNAL)
+
+    expect(result).not.toBeNull()
+    expect(compact.calls[0]?.messages).toHaveLength(3)
   })
 
   it('reports a live unmatched bracket as busy without summarizing', async () => {
