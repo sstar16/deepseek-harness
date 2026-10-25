@@ -13,7 +13,7 @@ import {
   resolveTargetPolicy,
 } from '@deepseek-ai/dsh-compaction-basic/src/config.ts'
 import type { CompactionResult } from '@deepseek-ai/dsh-compaction'
-import LlmRuntime, { createUserMessage, ToolCallId, CONTEXT_WINDOW_EXCEEDED_CODE, createSystemMessage, createToolResultMessage, LlmAdapter , createMessage } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { createUserMessage, ToolCallId, CONTEXT_WINDOW_EXCEEDED_CODE, createSystemMessage, createToolResultMessage, LlmAdapter, ReasoningEffortId , createMessage } from '@deepseek-ai/dsh-llm'
 import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import type {
   ContentBlock,
@@ -1330,8 +1330,25 @@ class ScriptedAdapter extends LlmAdapter {
   constructor(
     private readonly blocks: readonly ContentBlock[],
     private readonly finish: (StreamChunk & { type: 'finish' })['reason'] = { kind: 'stop' },
+    private readonly defaultEffort?: ReasoningEffortId,
   ) {
     super()
+  }
+
+  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    return Promise.resolve({
+      provider,
+      id: model,
+      name: model,
+      reasoning: {
+        efforts: [
+          { id: ReasoningEffortId('off'), name: 'Off' },
+          { id: ReasoningEffortId('high'), name: 'High' },
+          { id: ReasoningEffortId('max'), name: 'Max' },
+        ],
+        ...this.defaultEffort === undefined ? {} : { defaultEffort: this.defaultEffort },
+      },
+    })
   }
 
   override async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
@@ -1373,12 +1390,13 @@ async function summarizerHarness(
   finish?: (StreamChunk & { type: 'finish' })['reason'],
   model = MODEL,
   config: BasicCompactionConfig = { auto: false },
+  defaultEffort?: ReasoningEffortId,
 ): Promise<{ ctx: Context; adapter: ScriptedAdapter; compact: ExposedCompactionEngine }> {
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(SessionProjectionRegistry)
   void new TokenMeter(ctx)
-  const adapter = new ScriptedAdapter(blocks, finish)
+  const adapter = new ScriptedAdapter(blocks, finish, defaultEffort)
   ctx.llm.registerAdapter([model], adapter)
   const compact = new ExposedCompactionEngine(ctx, config)
   return { ctx, adapter, compact }
@@ -1554,13 +1572,67 @@ describe('default one-shot summarizer', () => {
     expect(adapter.lastOptions?.model).toBe('routed')
   })
 
-  it('records the model actually dispatched after one-shot stream routing', async () => {
+  it('preserves the routed reasoning effort in the summary call and event', async () => {
+    const { adapter, compact } = await summarizerHarness(
+      [{ type: 'text', text: 'summary' }], undefined, MODEL, { auto: false }, ReasoningEffortId('off'),
+    )
+    const session = conversation(3)
+    session.append('request/header', {
+      header: { config: { provider: MODEL, model: MODEL, reasoningEffort: ReasoningEffortId('max') } },
+      reason: 'resume',
+    })
+    const nodes = [...session.surface.nodes]
+
+    await compact.compactRegion(nodes[0]!, nodes[1]!, agent(session, MODEL), SIGNAL)
+
+    expect(adapter.lastOptions?.reasoningEffort).toBe('max')
+    expect(session.snapshotEvents().findLast(event => event.type === 'compaction/summary')?.data)
+      .toMatchObject({ reasoningEffort: 'max' })
+  })
+
+  it('does not carry reasoning effort into a different summarization route', async () => {
+    const { ctx, compact } = await summarizerHarness([{ type: 'text', text: 'unused' }], undefined, MODEL, {
+      auto: false,
+      summarizationProvider: 'summary-other',
+      summarizationModel: 'summary-other',
+    })
+    const other = new ScriptedAdapter([{ type: 'text', text: 'other summary' }], undefined, ReasoningEffortId('off'))
+    ctx.llm.registerAdapter(['summary-other'], other)
+    const session = conversation(1)
+    session.append('request/header', {
+      header: { config: { provider: MODEL, model: MODEL, reasoningEffort: ReasoningEffortId('max') } },
+      reason: 'resume',
+    })
+
+    const output = await compact.runSummarize(promptInput('history'), agent(session, MODEL))
+
+    expect(other.lastOptions?.reasoningEffort).toBe('off')
+    expect(output).not.toHaveProperty('reasoningEffort')
+  })
+
+  it('uses the complete AgentOptions route and reasoning effort when no durable route exists', async () => {
+    const { adapter, compact } = await summarizerHarness(
+      [{ type: 'text', text: 'summary' }], undefined, MODEL, { auto: false }, ReasoningEffortId('off'),
+    )
+    const owner = {
+      session: Session.create(SessionId('headerless-effort-summary')),
+      options: { provider: MODEL, model: MODEL, reasoningEffort: ReasoningEffortId('high') },
+    } as Agent
+
+    const output = await compact.runSummarize(promptInput('history'), owner)
+
+    expect(adapter.lastOptions?.reasoningEffort).toBe('high')
+    expect(output).toMatchObject({ provider: MODEL, model: MODEL, reasoningEffort: 'high' })
+  })
+
+  it('records the model and reasoning effort actually dispatched after one-shot stream routing', async () => {
     const { ctx, compact } = await summarizerHarness([{ type: 'text', text: 'unused' }])
-    const routedAdapter = new ScriptedAdapter([{ type: 'text', text: 'routed summary' }])
+    const routedAdapter = new ScriptedAdapter([{ type: 'text', text: 'routed summary' }], undefined, ReasoningEffortId('off'))
     ctx.llm.registerAdapter(['routed-summary-provider'], routedAdapter)
     ctx.on('llm/stream', (options, next) => {
       options.provider = 'routed-summary-provider'
       options.model = 'routed-summary-model'
+      options.reasoningEffort = ReasoningEffortId('max')
       return next()
     })
 
@@ -1572,9 +1644,11 @@ describe('default one-shot summarizer', () => {
       llmStreamCall: true,
       provider: 'routed-summary-provider',
       model: 'routed-summary-model',
+      reasoningEffort: 'max',
     })
     expect(routedAdapter.lastOptions?.provider).toBe('routed-summary-provider')
     expect(routedAdapter.lastOptions?.model).toBe('routed-summary-model')
+    expect(routedAdapter.lastOptions?.reasoningEffort).toBe('max')
   })
 
   it('fails clearly when no complete summarization target can be resolved', async () => {

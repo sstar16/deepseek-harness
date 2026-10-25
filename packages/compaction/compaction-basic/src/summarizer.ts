@@ -8,7 +8,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { contentHasImage, BlockAssembler, LlmError } from '@deepseek-ai/dsh-llm'
 import { deepFreeze } from '@deepseek-ai/dsh-util-values'
 import type {
-  ContentBlock, FinishReason, GenerateOptions, Message, RequestMessage, TokenUsage, ToolSchema,
+  ContentBlock, FinishReason, GenerateOptions, Message, RequestMessage, ReasoningEffortId, TokenUsage, ToolSchema,
 } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 
@@ -88,6 +88,8 @@ export type SummaryResult = {
   summary: ContentBlock[]
   provider: string
   model: string
+  /** Reasoning effort explicitly supplied with the summary request, when present. */
+  reasoningEffort?: ReasoningEffortId
   maxTokens?: number
   /** Provider-reported usage for this summarization request. */
   usage?: TokenUsage
@@ -132,7 +134,11 @@ export async function summarizeWithLlm(
     && agent.options.provider.length > 0
     && agent.options.model !== undefined
     && agent.options.model.length > 0
-    ? { provider: agent.options.provider, model: agent.options.model }
+    ? {
+      provider: agent.options.provider,
+      model: agent.options.model,
+      ...agent.options.reasoningEffort === undefined ? {} : { reasoningEffort: agent.options.reasoningEffort },
+    }
     : undefined
   const target = configured ?? latest ?? agentTarget
   if (target === undefined) {
@@ -140,6 +146,9 @@ export async function summarizeWithLlm(
       'no provider/model available for summarization: set both BasicCompactionConfig summarization fields, route one request, or set both AgentOptions fields',
     )
   }
+  const inheritedEffort = [latest, agentTarget].find(candidate => (
+    candidate?.provider === target.provider && candidate.model === target.model
+  ))?.reasoningEffort
 
   const assembler = new BlockAssembler()
   const messages: RequestMessage[] = [
@@ -152,6 +161,7 @@ export async function summarizeWithLlm(
   const options: GenerateOptions = {
     provider: target.provider,
     model: target.model,
+    ...inheritedEffort === undefined ? {} : { reasoningEffort: inheritedEffort },
     messages,
     toolHistory: agent.session.toolHistory(),
     ...input.tools === undefined ? {} : { tools: [...input.tools] },
@@ -175,6 +185,7 @@ export async function summarizeWithLlm(
     llmStreamCall: true,
     provider: options.provider,
     model: options.model,
+    ...options.reasoningEffort === undefined ? {} : { reasoningEffort: options.reasoningEffort },
     maxTokens: config.maxTokens,
     ...(assembler.usage === undefined ? {} : { usage: assembler.usage }),
   }

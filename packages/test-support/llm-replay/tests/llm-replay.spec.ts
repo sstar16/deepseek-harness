@@ -16,6 +16,7 @@ import LlmRuntime, {
   createUserMessage,
   GenerateOptions,
   LlmAdapter,
+  ReasoningEffortId,
   StreamChunk,
   type ToolResultMessage,
 } from '@deepseek-ai/dsh-llm'
@@ -999,6 +1000,7 @@ describe('deriveReplayScript', () => {
           shadowedTokenCount: 20,
           provider: 'mock',
           model: 'mock',
+          reasoningEffort: ReasoningEffortId('max'),
           usage,
         },
       },

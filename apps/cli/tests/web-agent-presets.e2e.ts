@@ -28,7 +28,7 @@ import { createPluginProfile } from '../../desktop/src/project-manager.ts'
 const SETTINGS_NAMESPACE = 'agent-preset-registry'
 const SUBAGENT_MODEL_SELECTION_SETTINGS_NAMESPACE = 'subagent-model-selection-settings'
 import { applyChildComposition, childSessionMeta } from '@deepseek-ai/dsh-subagent'
-import { ToolCallId, LlmAdapter, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { ToolCallId, LlmAdapter, ReasoningEffortId, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-compaction-basic'
 import type {} from '@deepseek-ai/dsh-skill'
@@ -54,7 +54,19 @@ class MinimalCompactionAdapter extends LlmAdapter {
   readonly requests: GenerateOptions[] = []
 
   override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
-    return Promise.resolve({ provider, id: model, name: model, context: { contextWindow: 100_000 } })
+    return Promise.resolve({
+      provider,
+      id: model,
+      name: model,
+      context: { contextWindow: 100_000 },
+      reasoning: {
+        efforts: [
+          { id: ReasoningEffortId('off'), name: 'Off' },
+          { id: ReasoningEffortId('max'), name: 'Max' },
+        ],
+        defaultEffort: ReasoningEffortId('off'),
+      },
+    })
   }
 
   override async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
@@ -420,7 +432,7 @@ describe('the shipped Web composition', () => {
     onTestFinished(unregister)
     const handle = await ctx.agents.create({
       sessionId: SessionId('preset-minimal-compaction'),
-      agentOptions: { provider: 'minimal-compaction-test', model: 'minimal-compaction-test' },
+      agentOptions: { provider: 'minimal-compaction-test', model: 'minimal-compaction-test', reasoningEffort: ReasoningEffortId('max') },
       setup: agentCtx => ctx.agentPresets.mount(agentCtx, 'minimal').then(() => undefined),
     })
     try {
@@ -434,7 +446,10 @@ describe('the shipped Web composition', () => {
       expect(handle.agent.session.surface.replaceGeneration).toBeGreaterThan(before)
       const summary = handle.agent.session.snapshotEvents().find(event => event.type === 'compaction/summary')
       expect(summary?.data.sourceCommandId).toBe(execution?.commandId)
-      expect(adapter.requests.filter(request => request.purpose === 'compaction')).toHaveLength(1)
+      expect(summary?.data.reasoningEffort).toBe('max')
+      const summaryRequests = adapter.requests.filter(request => request.purpose === 'compaction')
+      expect(summaryRequests).toHaveLength(1)
+      expect(summaryRequests[0]?.reasoningEffort).toBe('max')
       handle.agent.followup(createUserMessage({
         content: [{ type: 'text', text: 'Continue the project task.' }], source: { kind: 'user' },
       }))
@@ -454,7 +469,7 @@ describe('the shipped Web composition', () => {
     onTestFinished(unregister)
     const handle = await ctx.agents.create({
       sessionId: SessionId('preset-minimal-pressure'),
-      agentOptions: { provider: 'minimal-pressure-test', model: 'minimal-pressure-test' },
+      agentOptions: { provider: 'minimal-pressure-test', model: 'minimal-pressure-test', reasoningEffort: ReasoningEffortId('max') },
       setup: agentCtx => ctx.agentPresets.mount(agentCtx, 'minimal').then(() => undefined),
     })
     try {
@@ -468,9 +483,12 @@ describe('the shipped Web composition', () => {
       const summaries = handle.agent.session.snapshotEvents().filter(event => event.type === 'compaction/summary')
       expect(summaries.length).toBeGreaterThan(0)
       expect(summaries.every(event => event.data.sourceCommandId === undefined)).toBe(true)
+      expect(summaries.every(event => event.data.reasoningEffort === 'max')).toBe(true)
       expect(handle.agent.session.snapshotEvents().some(event => event.type === 'compaction/start'
         && event.data.turn !== null)).toBe(true)
-      expect(adapter.requests.some(request => request.purpose === 'compaction')).toBe(true)
+      const summaryRequests = adapter.requests.filter(request => request.purpose === 'compaction')
+      expect(summaryRequests.length).toBeGreaterThan(0)
+      expect(summaryRequests.every(request => request.reasoningEffort === 'max')).toBe(true)
     } finally {
       await handle.dispose()
     }
